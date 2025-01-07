@@ -33,6 +33,7 @@ from qgis.core import QgsRectangle
 from qgis.core import QgsCoordinateTransformContext
 from qgis.core import QgsCsException
 from qgis.core import QgsCoordinateReferenceSystem, QgsProviderRegistry
+from qgis.core import QgsGeometry
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -235,8 +236,20 @@ class IdentifProj:
             if self.dockwidget == None:
                 # Create the dockwidget (after translation) and keep reference
                 self.dockwidget = IdentifProjDockWidget() #construction - mettre des actions ici, config
-                self.calc_BBox()
-                self.dockwidget.btGetCoord.clicked.connect(self.identifProj) #essayer d'ajouter une condition pour ne pas entrer un integer
+                
+                ## Gestion du fichier json de transformation de limites de projection
+                script_dir = os.path.dirname(__file__)
+                config_dir = os.path.join(script_dir, "config")
+                json_file_path = os.path.join(config_dir, "crs_with_bounds.json")
+                # Vérifier si le fichier existe
+                if not os.path.exists(json_file_path):
+                    self.calc_BBox(json_file_path)
+                
+                #on charge ensuite ce fichier json
+                data = self.load_crs_data(json_file_path)
+                
+                #lancement de la fonction pour récupérer les coordonnées
+                self.dockwidget.btGetCoord.clicked.connect(lambda: self.identifProj(data)) #essayer d'ajouter une condition pour ne pas entrer un integer
 
             # connect to provide cleanup on closing of dockwidget
             self.dockwidget.closingPlugin.connect(self.onClosePlugin)
@@ -248,7 +261,7 @@ class IdentifProj:
             
     #--------------------------------------------------------------------------
      
-    def identifProj(self):
+    def identifProj(self, crs_dic):
         """
         """
         
@@ -268,57 +281,30 @@ class IdentifProj:
         point = QgsPointXY(X,Y)
         print(point)
         
-        ##Tester les différents SRC disponibles dans la BDD QGIS
-        crs = QgsCoordinateReferenceSystem()
-        liste_crs = crs.validSrsIds()
+        list_valid_crs = []
+        list_valid_pt = []
         
-        liste_valid_crs = []
-        liste_valid_pt = []
-        #print(liste_crs)
+        #print(crs_dic)
+        for crs in crs_dic:
+            
+            coordinates = crs['transform_bounds']['coordinates'][0]  # Liste des sommets
+            points = [QgsPointXY(coord[0], coord[1]) for coord in coordinates]  # Conversion en QgsPointXY
+            polygon = QgsGeometry.fromPolygonXY([points])
+            
+            if polygon.contains(point):
+                epsg = crs['auth_id']
+                print(epsg)
+                crs_v = QgsCoordinateReferenceSystem(epsg)
+                pt = QgsReferencedPointXY(point, crs_v)
+                list_valid_pt.append(pt)
+                list_valid_crs.append(crs_v)
+                
+        #print(list_valid_pt, list_valid_crs)
         
-        #Parcourir la liste, créer un objet SRC et tester la coordonnée en entrée
-        # for i in range (20):
-        #for elem in liste_crs:
-        for i in range(200):
-            crs_WGS = QgsCoordinateReferenceSystem('EPSG:4326')
-            crs_test = crs.fromSrsId(liste_crs[i])
-            #print(crs_test)
-            
-            context = QgsProject.instance().transformContext()
-            transformer = QgsCoordinateTransform(crs_test,crs_WGS, context)
-            
-            # Vérifie si la transformation est valide
-            if not transformer.isValid():
-                print(f"Transformation non valide pour le CRS EPSG:{elem}")
-                continue
-
-            try:
-            # Transformation du point
-                pt_test = transformer.transform(point)
-            except QgsCsException as e:
-                print(f"Erreur de transformation pour EPSG:{crs_test} : {e}")
-                continue
-            
-            #pt_test = transformer.transform(point) #transformation du point avec le SRC à tester en WGS84
-            #print(pt_test)
-            
-            valid_area = crs_test.bounds()
-            #print(valid_area)
-            
-            if valid_area.contains(pt_test):
-                pt = QgsReferencedPointXY(point, crs_test)
-                liste_valid_pt.append(pt)
-                liste_valid_crs.append(crs_test)
-                print("Ce point fait sens dans la projection.")
-            else:
-                #print("Le point ne peut pas avoir cette projection.")
-                pass
-                
-                
-        print("liste des SRC valide pour ce point", liste_valid_crs)
+        return list_valid_pt, list_valid_crs
         
     
-    def calc_BBox(self):
+    def calc_BBox(self, json_file_path):
     
         # Liste pour stocker les différents SRC dans QGIS
         crs_WGS = QgsCoordinateReferenceSystem('EPSG:4326')
@@ -328,7 +314,6 @@ class IdentifProj:
         
         for crs_id in liste_crs:
             crs = crs.fromSrsId(crs_id)
-            print(crs)
             
             if crs.isValid():
                 bounds = crs.bounds()  # Bounding box en WGS 84
@@ -354,6 +339,8 @@ class IdentifProj:
                         print(f"Erreur de transformation pour EPSG:{crs} : {e}")
                         continue
                     
+                    coord_poly = [[c_ll.x(), c_ll.y()], [c_lu.x(), c_lu.y()], [c_uu.x(), c_uu.y()], [c_ul.x(), c_ul.y()], [c_ll.x(), c_ll.y()]]
+                    
                     
                     crs_info = {
                         "auth_id": crs.authid(),
@@ -365,10 +352,8 @@ class IdentifProj:
                             "y_max": bounds.yMaximum()
                         },
                         "transform_bounds": {
-                            "c_ll": (c_ll.x(), c_ll.y()),
-                            "c_lu": (c_lu.x(), c_lu.y()),
-                            "c_uu": (c_uu.x(), c_uu.y()),
-                            "c_ul": (c_ul.x(), c_ul.y())
+                            "type": "Polygon",
+                            "coordinates": [coord_poly]  # GeoJSON utilise une liste imbriquée
                             }
                     }
                     crs_json.append(crs_info)
@@ -389,11 +374,32 @@ class IdentifProj:
             print(f"Dossier 'config' déjà existant à : {config_dir}")
     
         # Définir le chemin du fichier JSON dans le dossier 'config' + exporter
-        output_file = os.path.join(config_dir, "crs_with_bounds.json")
+        output_file = json_file_path
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(crs_json, f, ensure_ascii=False, indent=4)
         
         print(f"Fichier JSON généré : {output_file}")
+        
+        
+    def load_crs_data(self, filename):
+        """
+        Charge un fichier JSON et le convertit en dictionnaire Python.
+        
+        :param filename: Chemin vers le fichier JSON.
+        :return: Dictionnaire contenant les données JSON.
+        """
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)  # Charge le contenu du fichier en un dictionnaire
+            return data
+        
+        except FileNotFoundError:
+            print(f"Erreur : le fichier {filename} est introuvable.")
+        except json.JSONDecodeError as e:
+            print(f"Erreur de décodage JSON dans {filename} : {e}")
+        except Exception as e:
+            print(f"Erreur inattendue : {e}")
+        return {}
         
         
         
