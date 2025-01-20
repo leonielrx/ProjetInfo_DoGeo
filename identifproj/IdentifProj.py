@@ -34,6 +34,12 @@ from qgis.core import QgsCoordinateTransformContext
 from qgis.core import QgsCsException
 from qgis.core import QgsCoordinateReferenceSystem, QgsProviderRegistry
 from qgis.core import QgsGeometry
+from qgis.core import QgsRasterLayer
+from qgis.core import QgsVectorLayer
+from qgis.core import QgsField
+from qgis.core import QgsFeature
+from PyQt5.QtCore import QVariant
+from PyQt5.QtWidgets import QApplication, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QMainWindow
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -42,6 +48,9 @@ from .resources import *
 from .IdentifProj_dockwidget import IdentifProjDockWidget
 import os.path
 import json
+
+# Import other functions
+from .Point2Coord import Point2Coord
 
 #import config_bbox
 
@@ -81,12 +90,18 @@ class IdentifProj:
         # TODO: We are going to let the user set this up in a future iteration
         self.toolbar = self.iface.addToolBar(u'IdentifProj')
         self.toolbar.setObjectName(u'IdentifProj')
+        
+        # Initialisation de la couche d'affichage
+        self.point_layer = None
 
         #print "** INITIALIZING IdentifProj"
 
         self.pluginIsActive = False
         self.dockwidget = None
-
+        
+        #Initialisation des autres fonctionnalités 
+        self.point_tool = None
+        self.p2c_isActive = False  # Attribut pour savoir si la fonctionnalité Point2Coord est activée
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -189,6 +204,7 @@ class IdentifProj:
             parent=self.iface.mainWindow())
 
     #--------------------------------------------------------------------------
+    ### Méthodes de gestion du plugin
 
     def onClosePlugin(self):
         """Cleanup necessary items here when plugin dockwidget is closed"""
@@ -221,7 +237,8 @@ class IdentifProj:
         del self.toolbar
 
     #--------------------------------------------------------------------------
-
+    ### Méthode qui gère les différentes méthodes du plugin
+    
     def run(self):
         """Run method that loads and starts the plugin"""
 
@@ -237,20 +254,29 @@ class IdentifProj:
                 # Create the dockwidget (after translation) and keep reference
                 self.dockwidget = IdentifProjDockWidget() #construction - mettre des actions ici, config
                 
-                ## Gestion du fichier json de transformation de limites de projection
+                ## Gestion du fichier courant
                 script_dir = os.path.dirname(__file__)
+                
+                # Chargement de la map
+                conf_dir = os.path.join(script_dir, "map")
+                map_file_path = os.path.join(conf_dir, "NE1_HR_LC_SR_W.tif")
+                self.load_map(map_file_path)
+                
+                # Chargement du fichier JSON s'il existe
                 config_dir = os.path.join(script_dir, "config")
                 json_file_path = os.path.join(config_dir, "crs_with_bounds.json")
-                # Vérifier si le fichier existe
                 if not os.path.exists(json_file_path):
                     self.calc_BBox(json_file_path)
                 
-                #on charge ensuite ce fichier json
                 data = self.load_crs_data(json_file_path)
                 
                 #lancement de la fonction pour récupérer les coordonnées
-                self.dockwidget.btGetCoord.clicked.connect(lambda: self.identifProj(data)) #essayer d'ajouter une condition pour ne pas entrer un integer
+                self.dockwidget.btGetCoord.clicked.connect(lambda: self.handleGetCoord(data)) #essayer d'ajouter une condition pour ne pas entrer un integer
 
+                # activer la fonction de récupération des click sur la map
+                self.dockwidget.act_p2c.clicked.connect(self.activate_canvasPressEvent)
+                self.dockwidget.des_p2c.clicked.connect(self.deactivate_canvasPressEvent)
+    
             # connect to provide cleanup on closing of dockwidget
             self.dockwidget.closingPlugin.connect(self.onClosePlugin)
 
@@ -260,7 +286,8 @@ class IdentifProj:
             self.dockwidget.show()
             
     #--------------------------------------------------------------------------
-     
+    ### Méthodes qui gèrent la fonctionnalité Coord2Point
+    
     def identifProj(self, crs_dic):
         """
         """
@@ -302,7 +329,82 @@ class IdentifProj:
         #print(list_valid_pt, list_valid_crs)
         
         return list_valid_pt, list_valid_crs
+    
+    
+    def displayPoints(self, points):
+        """
+        Ajoute une liste de points à la couche vectorielle.
+        :param points: 
+        """
         
+        print("Affichage des points")
+        
+        # Créer une couche vectorielle temporaire
+        point_layer = QgsVectorLayer(
+            "Point?crs=EPSG:4326",  # Couche de type Point avec système de coordonnées WGS 84
+            "Mes Points",          # Nom de la couche
+            "memory"               # Type de stockage : en mémoire
+        )
+
+        # Ajouter des champs (attributs) à la couche
+        point_layer.dataProvider().addAttributes([
+            QgsField("epsg", QVariant.String),
+            QgsField("description", QVariant.String),
+            QgsField("X", QVariant.Double),
+            QgsField("Y", QVariant.Double)
+        ])
+        point_layer.updateFields()
+
+        # Récupérer le fournisseur de données de la couche
+        data_provider = point_layer.dataProvider()
+        crs_WGS = QgsCoordinateReferenceSystem('EPSG:4326')
+
+        # Créer des entités pour chaque point
+        features = []
+        for point in points:
+            # On exprime les points dans la projection de la carte
+            try:
+                x = point.x()
+                y = point.y()
+                
+                crs_point = point.crs()
+                epsg = crs_point.authid()
+                description = crs_point.description()
+                
+                context = QgsProject.instance().transformContext()
+                transformer = QgsCoordinateTransform(crs_point, crs_WGS, context)
+                pt = transformer.transform(point)
+                
+            except QgsCsException as e:
+                print(f"Erreur de transformation pour")
+                continue
+            
+            feature = QgsFeature()
+            feature.setGeometry(QgsGeometry.fromPointXY(pt))
+            feature.setAttributes([epsg, description, x, y])
+            features.append(feature)
+
+        # Ajouter les entités à la couche
+        data_provider.addFeatures(features)
+
+        # Mettre à jour la couche pour afficher les points
+        point_layer.updateExtents()
+        # Ajouter la couche au projet QGIS
+        QgsProject.instance().addMapLayer(point_layer)
+        
+    def handleGetCoord(self, crs_dic):
+        """
+        Gestionnaire pour le clic du bouton. Appelle identifProj pour récupérer les
+        points et les affiche sur la carte.
+        """
+        # Appel à identifProj pour récupérer la liste des points
+        points = self.identifProj(crs_dic)[0]
+    
+        # Afficher les points sur la carte
+        self.displayPoints(points)
+    
+    #--------------------------------------------------------------------------
+    ### Méthode de configuration des autres éléments du plugin 
     
     def calc_BBox(self, json_file_path):
     
@@ -400,6 +502,48 @@ class IdentifProj:
         except Exception as e:
             print(f"Erreur inattendue : {e}")
         return {}
+    
+    
+    def load_map(self, filename):
+        """
+        Charge la map (format tiff) pour afficher les résultats et cliquer sur les points
+        """
+
+        # Charger le fichier GeoTIFF comme couche raster
+        layer = QgsRasterLayer(filename, "Map")
+
+        if not layer.isValid():
+            # Si le fichier n'est pas valide, afficher une erreur
+            print(f"Erreur : le fichier TIFF '{filename}' n'est pas valide.")
+            return
+
+        # Ajouter la couche au projet actuel
+        QgsProject.instance().addMapLayer(layer)
+        print(f"Le fichier '{filename}' a été chargé avec succès.")
+        
+    #--------------------------------------------------------------------------
+    ### Méthode qui gèrent les autres fonctionnalités du plugin    
+        
+        
+    def activate_canvasPressEvent(self):
+        """Active l'outil de récupération des coordonnées."""
+        if not hasattr(self, 'point_tool') or self.point_tool is None:
+            # Crée l'outil Point2Coord uniquement s'il n'existe pas
+            self.point_tool = Point2Coord(self.iface, self.dockwidget)
+        
+        # Active l'outil pour récupérer les coordonnées sur la carte
+        self.iface.mapCanvas().setMapTool(self.point_tool)
+        print("Outil de récupération des coordonnées activé.")
+        
+    def deactivate_canvasPressEvent(self):
+        """Désactive l'outil de récupération des coordonnées."""
+        if hasattr(self, 'point_tool') and self.point_tool is not None:
+            # Réinitialise l'outil de la carte à l'outil par défaut (outil de navigation)
+            self.iface.mapCanvas().unsetMapTool(self.point_tool)
+            self.point_tool = None  # Libère l'instance pour éviter des conflits futurs
+            print("Outil de récupération des coordonnées désactivé.")
+        else:
+            print("Aucun outil de récupération des coordonnées actif à désactiver.")
         
         
         
