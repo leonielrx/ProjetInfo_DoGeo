@@ -40,6 +40,9 @@ from qgis.core import QgsField
 from qgis.core import QgsFeature
 from PyQt5.QtCore import QVariant
 from PyQt5.QtWidgets import QApplication, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QMainWindow
+from qgis.PyQt.QtCore import Qt
+from qgis._core import Qgis
+from PyQt5.QtWidgets import QProgressDialog
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -51,12 +54,21 @@ import json
 
 # Import other functions
 from .Point2Coord import Point2Coord
+from .BBox2Coord import BBox2Coord
 
 #import config_bbox
 
 
 class IdentifProj:
-    """QGIS Plugin Implementation."""
+    """
+    QGIS Plugin Implementation.
+    
+    Classe qui contient toutes les méthodes d'initialisation, lancement et gestion du plugin.
+    
+    Contient les méthodes de la fonctionnalités principale: Coord2Point
+    
+    Contient les méthodes qui permettent de gérer les autres classes/fonctionalités du plugin
+    """
 
     def __init__(self, iface):
         """Constructor.
@@ -99,9 +111,11 @@ class IdentifProj:
         self.pluginIsActive = False
         self.dockwidget = None
         
-        #Initialisation des autres fonctionnalités 
+        #Création des attributs nécessaires pour les différentes fonctionnalités 
         self.point_tool = None
-        self.p2c_isActive = False  # Attribut pour savoir si la fonctionnalité Point2Coord est activée
+        self.p2c_isActive = False
+        self.bbox_tool = None
+        self.data = None
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -257,25 +271,30 @@ class IdentifProj:
                 ## Gestion du fichier courant
                 script_dir = os.path.dirname(__file__)
                 
-                # Chargement de la map
+                ## Chargement de la map lors du lencement du plugin - map en WGS84
                 conf_dir = os.path.join(script_dir, "map")
                 map_file_path = os.path.join(conf_dir, "NE1_HR_LC_SR_W.tif")
                 self.load_map(map_file_path)
                 
-                # Chargement du fichier JSON s'il existe
+                ## Création du fichier json de configuration lors du premier lancement du plugin
                 config_dir = os.path.join(script_dir, "config")
                 json_file_path = os.path.join(config_dir, "crs_with_bounds.json")
                 if not os.path.exists(json_file_path):
                     self.calc_BBox(json_file_path)
                 
-                data = self.load_crs_data(json_file_path)
+                ## Chargement du fichier json de configuration dans une variable utilisée dans les différentes fonctionnalités
+                self.data = self.load_crs_data(json_file_path)
                 
-                #lancement de la fonction pour récupérer les coordonnées
-                self.dockwidget.btGetCoord.clicked.connect(lambda: self.handleGetCoord(data)) #essayer d'ajouter une condition pour ne pas entrer un integer
+                ## Lancement de la fonction Coord2Point (avec appui sur le pushbutton dans l'interface)
+                self.dockwidget.btGetCoord.clicked.connect(lambda: self.handleGetCoord(self.data))
 
-                # activer la fonction de récupération des click sur la map
+                ## Gestion fonctionnalité Point2Coord: active/désactive la fonction de récupération des click sur la map
                 self.dockwidget.act_p2c.clicked.connect(self.activate_canvasPressEvent)
                 self.dockwidget.des_p2c.clicked.connect(self.deactivate_canvasPressEvent)
+                
+                ## Gestion fonctionnalité BBox2Coord: active/désactive la création de BBox sur la map
+                self.dockwidget.createBBox.clicked.connect(self.activate_BBox)
+                self.dockwidget.desBBox.clicked.connect(self.deactivate_BBox)
     
             # connect to provide cleanup on closing of dockwidget
             self.dockwidget.closingPlugin.connect(self.onClosePlugin)
@@ -290,13 +309,23 @@ class IdentifProj:
     
     def identifProj(self, crs_dic):
         """
+        Fonction principale de la classe (et du plugin) qui correspond à la fonctionnalité Coord2Point
+        Récupère les coordonées entrées par l'utilisateur pour trouver les projections correspondant à ces coordonnées
+        
+        crs_dic : liste de dictionnaires ; chaque dictionnaire correspond à la description d'une projection
+        Cette liste de dictionnaires est obtenue après le chargement du fichier json de configuration
+        
+        list_valid_pt : liste de QgsReferencePointXY ; correspond aux points avec les coordonnées entrées pas l'utilisateur dans 
+        les différentes projections
+        list_valid_crs : liste de QgsCoordinateReferenceSystem ; correspond aux projections valides pour le point entré
+        
         """
         
-        ##Récupération des coordonnées entrées par l'utilisateur
+        ## Récupération des coordonnées entrées par l'utilisateur
         x = self.dockwidget.x.text()
         y = self.dockwidget.y.text()
-        print("récuperation des coordonnées:", x, y)
         
+        ## Vérifier que l'utilisateur entre des coordonnées valides
         try:
             X = float(x)
             Y = float(y)
@@ -306,47 +335,59 @@ class IdentifProj:
             return
         
         point = QgsPointXY(X,Y)
-        print(point)
         
         list_valid_crs = []
         list_valid_pt = []
         
-        #print(crs_dic)
+        ## Créer et configurer la barre de progression pour faire patienter l'utilisateur
+        progress = QProgressDialog("Calcul en cours...", "Annuler", 0, len(crs_dic), self.iface.mainWindow())
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        i = 0
+        
+        ## Boucle sur la liste des projections disponibles pour tester les différentes projections
         for crs in crs_dic:
             
-            coordinates = crs['transform_bounds']['coordinates'][0]  # Liste des sommets
-            points = [QgsPointXY(coord[0], coord[1]) for coord in coordinates]  # Conversion en QgsPointXY
+            ## Gestion de la progessbar
+            i+=1
+            progress.setValue(i)
+            
+            ## Récupérer le polygon de zone de validité de la projection dans les coordonnées de la projections
+            coordinates = crs['transform_bounds']['coordinates'][0]
+            points = [QgsPointXY(coord[0], coord[1]) for coord in coordinates]
             polygon = QgsGeometry.fromPolygonXY([points])
             
+            ## Test pour savoir si les coordonnées entrées se situent dans l'emprise de la projection
             if polygon.contains(point):
                 epsg = crs['auth_id']
-                print(epsg)
                 crs_v = QgsCoordinateReferenceSystem(epsg)
                 pt = QgsReferencedPointXY(point, crs_v)
                 list_valid_pt.append(pt)
                 list_valid_crs.append(crs_v)
                 
-        #print(list_valid_pt, list_valid_crs)
+        # Fermer la barre de progression
+        progress.close()
         
         return list_valid_pt, list_valid_crs
     
     
     def displayPoints(self, points):
         """
+        Cette fonction s'occupe de l'affichage des points dans les différentes projections (avec les coordonées entrées par l'utilisateur')
         Ajoute une liste de points à la couche vectorielle.
-        :param points: 
+        
+        points: liste de QgsReferencedPointXY ; liste des points à afficher
         """
         
-        print("Affichage des points")
-        
-        # Créer une couche vectorielle temporaire
+        ## Créer une couche vectorielle en WGS84 (pour correspondre au fond de carte/map)
         point_layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",  # Couche de type Point avec système de coordonnées WGS 84
-            "Mes Points",          # Nom de la couche
-            "memory"               # Type de stockage : en mémoire
+            "Point?crs=EPSG:4326",  
+            "Mes Points",          
+            "memory"               
         )
 
-        # Ajouter des champs (attributs) à la couche
+        ## Ajouter des champs (attributs) à la couche - ces champs décrivent le point affiché (notamment sa projection)
         point_layer.dataProvider().addAttributes([
             QgsField("epsg", QVariant.String),
             QgsField("description", QVariant.String),
@@ -355,14 +396,26 @@ class IdentifProj:
         ])
         point_layer.updateFields()
 
-        # Récupérer le fournisseur de données de la couche
+        ## Récupérer le fournisseur de données de la couche
         data_provider = point_layer.dataProvider()
         crs_WGS = QgsCoordinateReferenceSystem('EPSG:4326')
+        
+        ## Créer et configurer la barre de progression
+        progress = QProgressDialog("Affichage des points en cours...", "Annuler", 0, len(points), self.iface.mainWindow())
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        i = 0
 
-        # Créer des entités pour chaque point
+        ## Créer des entités pour chaque point
         features = []
         for point in points:
-            # On exprime les points dans la projection de la carte
+            
+            ## Gestion de la progessbar
+            i+=1
+            progress.setValue(i)
+            
+            ## Transformation des coordonnées dans la projection de la carte (pour l'affichage)
             try:
                 x = point.x()
                 y = point.y()
@@ -384,18 +437,23 @@ class IdentifProj:
             feature.setAttributes([epsg, description, x, y])
             features.append(feature)
 
-        # Ajouter les entités à la couche
+        ## Ajouter les entités à la couche
         data_provider.addFeatures(features)
 
-        # Mettre à jour la couche pour afficher les points
+        ## Mettre à jour la couche pour afficher les points
         point_layer.updateExtents()
         # Ajouter la couche au projet QGIS
         QgsProject.instance().addMapLayer(point_layer)
         
+        ## Fermer la barre de progression
+        progress.close()
+        
     def handleGetCoord(self, crs_dic):
         """
-        Gestionnaire pour le clic du bouton. Appelle identifProj pour récupérer les
-        points et les affiche sur la carte.
+        Gestionnaire pour le clic du bouton: appelle identifProj pour récupérer les points et les afficher sur la carte.
+        
+        crs_dic : liste de dictionnaires ; chaque dictionnaire correspond à la description d'une projection
+        Cette liste de dictionnaires est obtenue après le chargement du fichier json de configuration
         """
         # Appel à identifProj pour récupérer la liste des points
         points = self.identifProj(crs_dic)[0]
@@ -404,18 +462,87 @@ class IdentifProj:
         self.displayPoints(points)
     
     #--------------------------------------------------------------------------
-    ### Méthode de configuration des autres éléments du plugin 
+    ### Méthodes de configuration des autres éléments du plugin
+        
+    def check_crs_bounds(self, crs):
+        """
+        Méthode qui assigne à chaque projection une (ou plusieurs) partie du monde pour laquelle cette projection est valide
+        
+        crs : QgsCoordinateReferenceSystem
+        
+        primary_regions: liste de String ; correspond aux premières zones de validité de la projection
+        secondary_regions: liste de String ; correspond aux secondes zones de validité de la projection
+        """
+        
+        ## Zone de validité de la projection en WGS84 (QgsRectangle)
+        bounds = crs.bounds()
+        
+        ## Définir les différentes parties du monde sous la forme de QgsRectangle
+        west = QgsRectangle(-180.0, -90.0, -60.0, 90.0)
+        mid = QgsRectangle(-60.0, -90.0, 60.0, 90.0)
+        east = QgsRectangle(60.0, -90.0, 180.0, 90.0)
+        
+        north = QgsRectangle(-180.0, 0.0, 180.0, 90.0)
+        south = QgsRectangle(-180.0, -90.0, 180.0, 0.0)
+    
+        primary_regions = []
+        secondary_regions = []
+    
+        ## Vérifier les intersections avec les premières et secondes classes
+        if bounds.intersects(west):
+            primary_regions.append("West")
+            if bounds.intersects(north):
+                secondary_regions.append("West North")
+            if bounds.intersects(south):
+                secondary_regions.append("West South")
+        
+        if bounds.intersects(mid):
+            primary_regions.append("Middle")
+            if bounds.intersects(north):
+                secondary_regions.append("Middle North")
+            if bounds.intersects(south):
+                secondary_regions.append("Middle South")
+        
+        if bounds.intersects(east):
+            primary_regions.append("East")
+            if bounds.intersects(north):
+                secondary_regions.append("East North")
+            if bounds.intersects(south):
+                secondary_regions.append("East South")
+        
+        return primary_regions, secondary_regions
+    
     
     def calc_BBox(self, json_file_path):
-    
-        # Liste pour stocker les différents SRC dans QGIS
+        """
+        Méthode qui génère le fichier de configuration json. Ce fichier renseigne pour chaque projection dans la base de données QGIS:
+        une description, son code EPSG, ses zones de validité (définie avec la fonction  check_crs_bounds) et les limites de validités
+        de la projection dans son propre src
+        
+        json_file_path: string ; correspond à l'endroit où le fichier json est enregistré
+        """
+        
+        ## Liste pour stocker les différents SRC dans QGIS
         crs_WGS = QgsCoordinateReferenceSystem('EPSG:4326')
         crs = QgsCoordinateReferenceSystem()
         liste_crs = crs.validSrsIds()
         crs_json = []
         
+        ## Créer et configurer la barre de progression - pour faire patienter l'utilisateur
+        progress = QProgressDialog("Création du fichier de configuration en cours...", "Annuler", 0, len(liste_crs), self.iface.mainWindow())
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        i = 0
+        
+        ## Boucle sur les projections disponibles dans QGIS pour recalculer les limites de validité
         for crs_id in liste_crs:
+            
             crs = crs.fromSrsId(crs_id)
+            
+            ## Gestion de la progessbar
+            i+=1
+            progress.setValue(i)
             
             if crs.isValid():
                 bounds = crs.bounds()  # Bounding box en WGS 84
@@ -424,14 +551,14 @@ class IdentifProj:
                     context = QgsProject.instance().transformContext()
                     transformer = QgsCoordinateTransform(crs_WGS, crs, context)
                     
-                    #on va chercher les coins de la bounding box - 2 par définition
+                    ## On va chercher les coins de la bounding box - 2 par définition
                     x_min = bounds.xMinimum()
                     y_min = bounds.yMinimum()
                     x_max = bounds.xMaximum()
                     y_max = bounds.yMaximum()
                     
-                    #on cherche ensuite les 4 coins de la bbox (car les bounds transformées formeront un polygone plus ou moins
-                    #rectangle en fonction de la projection) + on les transforme dans la projection de la boucle
+                    ## On cherche ensuite les 4 coins de la bbox (car les bounds transformées formeront un polygone plus ou moins
+                    ## rectangle en fonction de la projection) + on les transforme dans la projection de la boucle
                     try:
                         c_ll = transformer.transform(QgsPointXY(x_min,y_min))
                         c_lu = transformer.transform(QgsPointXY(x_min,y_max))
@@ -443,10 +570,15 @@ class IdentifProj:
                     
                     coord_poly = [[c_ll.x(), c_ll.y()], [c_lu.x(), c_lu.y()], [c_uu.x(), c_uu.y()], [c_ul.x(), c_ul.y()], [c_ll.x(), c_ll.y()]]
                     
+                    ## On cherche les zones de validés grossière de la projection
+                    prim, sec = self.check_crs_bounds(crs)
                     
+                    ## On rempli les différents du json pour chaque projection
                     crs_info = {
                         "auth_id": crs.authid(),
                         "name": crs.description(),
+                        "primary region": prim,
+                        "sec region": sec,
                         "bounding_box_WGS84": {
                             "x_min": bounds.xMinimum(),
                             "y_min": bounds.yMinimum(),
@@ -459,23 +591,25 @@ class IdentifProj:
                             }
                     }
                     crs_json.append(crs_info)
+                
                     
-                #break
+        # Fermer la barre de progression
+        progress.close()
         
         ## Exporter en fichier JSON
-        # Obtenir le répertoire du fichier script .py
         script_dir = os.path.dirname(__file__)
-        # Définir le chemin du dossier 'config'
+        
+        ## Définir le chemin du dossier 'config'
         config_dir = os.path.join(script_dir, "config")
     
-        # Vérifier si le dossier 'config' existe, sinon le créer
+        ## Vérifier si le dossier 'config' existe, sinon le créer
         if not os.path.exists(config_dir):
             os.makedirs(config_dir)
             print(f"Dossier 'config' créé à : {config_dir}")
         else:
             print(f"Dossier 'config' déjà existant à : {config_dir}")
     
-        # Définir le chemin du fichier JSON dans le dossier 'config' + exporter
+        ## Définir le chemin du fichier JSON dans le dossier 'config' + exporter
         output_file = json_file_path
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(crs_json, f, ensure_ascii=False, indent=4)
@@ -485,11 +619,13 @@ class IdentifProj:
         
     def load_crs_data(self, filename):
         """
-        Charge un fichier JSON et le convertit en dictionnaire Python.
+        Charge le fichier JSON de configuration et le convertit en dictionnaire Python.
         
-        :param filename: Chemin vers le fichier JSON.
-        :return: Dictionnaire contenant les données JSON.
+        filename: Chemin vers le fichier JSON
+        
+        return: liste de dictionnaires contenant les données du JSON (les descriptions des projections)
         """
+        
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 data = json.load(f)  # Charge le contenu du fichier en un dictionnaire
@@ -506,44 +642,71 @@ class IdentifProj:
     
     def load_map(self, filename):
         """
-        Charge la map (format tiff) pour afficher les résultats et cliquer sur les points
+        Charge la map/ fond de carte (format tiff) du plugin
+        
+        filename: Chemin vers le fichier tiff
         """
 
-        # Charger le fichier GeoTIFF comme couche raster
+        ## Charger le fichier GeoTIFF comme couche raster
         layer = QgsRasterLayer(filename, "Map")
 
         if not layer.isValid():
-            # Si le fichier n'est pas valide, afficher une erreur
+            ## Si le fichier n'est pas valide, afficher une erreur
             print(f"Erreur : le fichier TIFF '{filename}' n'est pas valide.")
             return
 
-        # Ajouter la couche au projet actuel
+        ## Ajouter la couche au projet actuel
         QgsProject.instance().addMapLayer(layer)
         print(f"Le fichier '{filename}' a été chargé avec succès.")
         
     #--------------------------------------------------------------------------
-    ### Méthode qui gèrent les autres fonctionnalités du plugin    
-        
+    ### Méthodes qui gèrent les autres fonctionnalités du plugin 
+    
+    #Point2Coord 
         
     def activate_canvasPressEvent(self):
         """Active l'outil de récupération des coordonnées."""
-        if not hasattr(self, 'point_tool') or self.point_tool is None:
-            # Crée l'outil Point2Coord uniquement s'il n'existe pas
-            self.point_tool = Point2Coord(self.iface, self.dockwidget)
         
-        # Active l'outil pour récupérer les coordonnées sur la carte
+        if not hasattr(self, 'point_tool') or self.point_tool is None:
+            ## Crée l'outil Point2Coord uniquement s'il n'existe pas
+            self.point_tool = Point2Coord(self.iface, self.dockwidget, self.data)
+        
+        ## Active l'outil pour récupérer les coordonnées sur la carte
         self.iface.mapCanvas().setMapTool(self.point_tool)
         print("Outil de récupération des coordonnées activé.")
         
     def deactivate_canvasPressEvent(self):
         """Désactive l'outil de récupération des coordonnées."""
+        
         if hasattr(self, 'point_tool') and self.point_tool is not None:
-            # Réinitialise l'outil de la carte à l'outil par défaut (outil de navigation)
+            ## Réinitialise l'outil de la carte à l'outil par défaut (outil de navigation)
             self.iface.mapCanvas().unsetMapTool(self.point_tool)
             self.point_tool = None  # Libère l'instance pour éviter des conflits futurs
             print("Outil de récupération des coordonnées désactivé.")
         else:
             print("Aucun outil de récupération des coordonnées actif à désactiver.")
+            
+    
+    #BBox2Coord      
+    
+    def activate_BBox(self):
+        """Active l'outil de récupération des coordonnées de la BBox"""
+        
+        if not hasattr(self, 'bbox_tool') or self.bbox_tool is None:
+            ## Crée l'outil BBox2Coord uniquement s'il n'existe pas
+            self.bbox_tool = BBox2Coord(self.iface, self.dockwidget, self.data)
+        
+        ## Active l'outil pour récupérer les coordonnées sur la carte
+        self.iface.mapCanvas().setMapTool(self.bbox_tool)
+        print("Outil de récupération bbox activé.")
+        
+    def deactivate_BBox(self):
+        """Désactive l'outil de récupération des coordonnées de la BBox"""
+        
+        if hasattr(self, 'bbox_tool') and self.bbox_tool is not None:
+            ## Désactive l'outil en réinitialisant le map tool
+            self.iface.mapCanvas().unsetMapTool(self.bbox_tool)
+            print("Outil de récupération bbox désactivé.")
         
         
         
